@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+
+    <meta name="viewport"
+          content="width=device-width, initial-scale=1.0">
+
+    <title>SingCompany</title>
+
+    <link rel="stylesheet" href="/styles.css">
+</head>
+
+<body>
+
+    <main class="container">
+
+        <h1>SingCompany</h1>
+
+        <p>Real-time audio transcription prototype</p>
+
+        <div class="controls">
+
+            <button id="startButton">
+                Start recording
+            </button>
+
+            <button id="stopButton" disabled>
+                Stop recording
+            </button>
+
+        </div>
+
+        <section class="monitor">
+
+            <h2>Status</h2>
+
+            <p id="status">Disconnected</p>
+
+            <h2>Audio statistics</h2>
+
+            <p id="stats">No audio received</p>
+
+        </section>
+
+        <section class="transcription">
+
+            <h2>Live transcription</h2>
+
+            <p id="partialTranscript">
+                Waiting for speech...
+            </p>
+
+            <h2>Final transcription</h2>
+
+            <p id="finalTranscript"></p>
+
+        </section>
+
+    </main>
+
+    <script type="module" src="/app.js"></script>
+
+</body>
+
+</html>

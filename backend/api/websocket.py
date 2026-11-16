@@ -1,34 +1,48 @@
 import asyncio
 import json
 import logging
+from contextlib import suppress
+
+import numpy as np
 
 from fastapi import APIRouter, WebSocket
 from fastapi import WebSocketDisconnect
 
 from backend.core.session import AudioSession
 from backend.core.events import EventType
+from backend.modules.asr.worker import run_asr_worker
+from backend.core.config import settings
 
-
-router = APIRouter()
 
 logger = logging.getLogger(__name__)
 
-
-MAX_CHUNK_BYTES = 1024 * 1024
+router = APIRouter()
 
 
 async def send_event(
-    websocket: WebSocket,
-    event: EventType,
-    data: dict | None = None
+    websocket,
+    event_type,
+    data=None,
+    send_lock=None
 ):
 
     message = {
-        "type": event.value,
+        "type": (
+            event_type.value
+            if isinstance(event_type, EventType)
+            else event_type
+        ),
         "data": data or {}
     }
 
-    await websocket.send_json(message)
+    if send_lock is None:
+
+        await websocket.send_json(message)
+
+    else:
+
+        async with send_lock:
+            await websocket.send_json(message)
 
 
 @router.websocket("/ws/audio")
@@ -37,9 +51,27 @@ async def audio_websocket(websocket: WebSocket):
     await websocket.accept()
 
     session = None
-    last_stats_time = asyncio.get_running_loop().time()
+    worker_task = None
 
-    logger.info("New WebSocket connection.")
+    send_lock = asyncio.Lock()
+
+    loop = asyncio.get_running_loop()
+
+    last_stats_time = loop.time()
+
+    engine = websocket.app.state.asr_engine
+    inference_semaphore = websocket.app.state.asr_semaphore
+
+    async def emit(event_type, data=None):
+
+        await send_event(
+            websocket,
+            event_type,
+            data,
+            send_lock
+        )
+
+    logger.info("WebSocket connected.")
 
     try:
 
@@ -47,88 +79,151 @@ async def audio_websocket(websocket: WebSocket):
 
             message = await websocket.receive()
 
-            # --------------------------------
-            # Binary audio message
-            # --------------------------------
+            if message["type"] == "websocket.disconnect":
+                logger.info("WebSocket disconnected.")
+                break
+
+            # ==========================================
+            # BINARY AUDIO
+            # ==========================================
 
             if message.get("bytes") is not None:
 
                 if session is None:
-                    await send_event(
-                        websocket,
+
+                    await emit(
                         EventType.SESSION_ERROR,
-                        {"message": "Start a session first."}
+                        {"message": "No active session."}
                     )
+
                     continue
 
                 payload = message["bytes"]
 
-                if len(payload) > MAX_CHUNK_BYTES:
-                    await send_event(
-                        websocket,
+                if (
+                    len(payload) == 0
+                    or len(payload) > settings.max_chunk_bytes
+                    or len(payload) % 4 != 0
+                ):
+
+                    await emit(
                         EventType.SESSION_ERROR,
-                        {"message": "Audio chunk too large."}
+                        {"message": "Invalid audio payload."}
                     )
+
                     continue
 
-                try:
-                    session.add_audio(payload)
+                audio = np.frombuffer(
+                    payload,
+                    dtype="<f4"
+                )
 
-                except ValueError as exc:
-                    await send_event(
-                        websocket,
+                if not np.isfinite(audio).all():
+
+                    await emit(
                         EventType.SESSION_ERROR,
-                        {"message": str(exc)}
+                        {"message": "Audio contains invalid values."}
                     )
+
                     continue
 
-                # Send statistics approximately once per second
-                now = asyncio.get_running_loop().time()
+                # Protect the pipeline from unexpected amplitudes.
+                audio = np.clip(audio, -1.0, 1.0)
 
-                if now - last_stats_time >= 1.0:
+                scheduling = session.add_audio(audio)
 
-                    await send_event(
-                        websocket,
+                if scheduling == "queue_full":
+
+                    await emit(
+                        EventType.ASR_STATUS,
+                        {
+                            "state": "queue_full",
+                            "dropped_jobs": session.dropped_jobs
+                        }
+                    )
+
+                elif scheduling == "queued":
+
+                    await emit(
+                        EventType.ASR_STATUS,
+                        {
+                            "state": "queued",
+                            "queue_size": session.queue.qsize()
+                        }
+                    )
+
+                # Periodic statistics
+                now = loop.time()
+
+                if (
+                    now - last_stats_time
+                    >= settings.stats_interval_seconds
+                ):
+
+                    stats = session.get_stats()
+
+                    await emit(
                         EventType.AUDIO_STATS,
-                        session.get_stats()
+                        {
+                            "duration_seconds": round(
+                                stats.duration_seconds, 2
+                            ),
+                            "samples_received": (
+                                stats.samples_received
+                            ),
+                            "chunks_received": (
+                                stats.chunks_received
+                            ),
+                            "queue_size": stats.queue_size,
+                            "dropped_jobs": stats.dropped_jobs
+                        }
                     )
 
                     last_stats_time = now
 
-            # --------------------------------
-            # JSON control message
-            # --------------------------------
+            # ==========================================
+            # JSON CONTROL MESSAGE
+            # ==========================================
 
             elif message.get("text") is not None:
 
                 try:
+
                     data = json.loads(message["text"])
 
-                except json.JSONDecodeError:
-                    await send_event(
-                        websocket,
+                    if not isinstance(data, dict):
+                        raise ValueError("Expected a JSON object.")
+
+                except (json.JSONDecodeError, ValueError):
+
+                    await emit(
                         EventType.SESSION_ERROR,
                         {"message": "Invalid JSON message."}
                     )
+
                     continue
 
                 event_type = data.get("type")
 
-                # Start session
+                # --------------------------------------
+                # SESSION START
+                # --------------------------------------
+
                 if event_type == EventType.SESSION_START.value:
 
                     if session is not None:
-                        await send_event(
-                            websocket,
+
+                        await emit(
                             EventType.SESSION_ERROR,
-                            {"message": "Session already started."}
+                            {"message": "Session already active."}
                         )
+
                         continue
 
                     metadata = data.get("data", {})
 
                     sample_rate = metadata.get("sample_rate")
-                    channels = metadata.get("channels", 1)
+                    channels = metadata.get("channels")
                     encoding = metadata.get("encoding")
 
                     if (
@@ -136,60 +231,101 @@ async def audio_websocket(websocket: WebSocket):
                         or isinstance(sample_rate, bool)
                         or not 8000 <= sample_rate <= 192000
                         or channels != 1
-                        or encoding != "float32"
+                        or encoding != "float32le"
                     ):
-                        await send_event(
-                            websocket,
+
+                        await emit(
                             EventType.SESSION_ERROR,
-                            {"message": "Unsupported audio configuration."}
+                            {
+                                "message": (
+                                    "Unsupported audio configuration."
+                                )
+                            }
                         )
+
                         continue
 
                     session = AudioSession(
                         sample_rate=sample_rate,
-                        channels=channels,
-                        encoding=encoding
+                        settings=settings
                     )
 
-                    logger.info(
-                        "Session started: %s",
-                        session.session_id
+                    worker_task = asyncio.create_task(
+                        run_asr_worker(
+                            queue=session.queue,
+                            engine=engine,
+                            target_sample_rate=(
+                                settings.target_sample_rate
+                            ),
+                            emit=emit,
+                            inference_semaphore=(
+                                inference_semaphore
+                            ),
+                            language=settings.asr_language
+                        )
                     )
 
-                    await send_event(
-                        websocket,
+                    await emit(
                         EventType.SESSION_READY,
                         {
-                            "session_id": session.session_id,
-                            "sample_rate": sample_rate
+                            "sample_rate": sample_rate,
+                            "target_sample_rate": (
+                                settings.target_sample_rate
+                            ),
+                            "buffer_seconds": (
+                                settings.buffer_seconds
+                            )
                         }
                     )
 
-                # Stop session
+                    logger.info(
+                        "Session started: sample_rate=%s",
+                        sample_rate
+                    )
+
+                # --------------------------------------
+                # AUDIO END
+                # --------------------------------------
+
                 elif event_type == EventType.AUDIO_END.value:
 
-                    if session is not None:
+                    if session is None:
+                        continue
 
-                        await send_event(
-                            websocket,
-                            EventType.AUDIO_STATS,
-                            session.get_stats()
-                        )
+                    await session.finish()
 
-                        await send_event(
-                            websocket,
-                            EventType.SESSION_CLOSED,
-                            {
-                                "session_id": session.session_id
-                            }
-                        )
+                    if worker_task is not None:
+                        await worker_task
 
-                        logger.info(
-                            "Session closed: %s",
-                            session.session_id
-                        )
+                    stats = session.get_stats()
 
-                        session = None
+                    await emit(
+                        EventType.AUDIO_STATS,
+                        {
+                            "duration_seconds": round(
+                                stats.duration_seconds, 2
+                            ),
+                            "chunks_received": stats.chunks_received,
+                            "dropped_jobs": stats.dropped_jobs
+                        }
+                    )
+
+                    await emit(
+                        EventType.SESSION_CLOSED,
+                        {
+                            "duration_seconds": round(
+                                stats.duration_seconds, 2
+                            )
+                        }
+                    )
+
+                    logger.info(
+                        "Session finished: %.2f seconds",
+                        stats.duration_seconds
+                    )
+
+                    session = None
+                    worker_task = None
 
     except WebSocketDisconnect:
 
@@ -197,12 +333,15 @@ async def audio_websocket(websocket: WebSocket):
 
     except Exception:
 
-        logger.exception("WebSocket error.")
+        logger.exception("WebSocket handler failed.")
 
     finally:
 
-        if session is not None:
-            logger.info(
-                "Session terminated: %s",
-                session.session_id
-            )
+        if worker_task is not None and not worker_task.done():
+
+            worker_task.cancel()
+
+            with suppress(asyncio.CancelledError):
+                await worker_task
+
+        logger.info("WebSocket cleanup completed.")
