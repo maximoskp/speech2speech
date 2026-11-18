@@ -9,6 +9,7 @@ from fastapi.staticfiles import StaticFiles
 from backend.api.websocket import router as websocket_router
 from backend.core.config import settings
 from backend.modules.asr.faster_whisper import FasterWhisperASR
+from backend.modules.llm.krikri import KrikriEngine
 
 
 logging.basicConfig(level=logging.INFO)
@@ -29,6 +30,17 @@ async def lifespan(app: FastAPI):
     app.state.asr_semaphore = asyncio.Semaphore(1)
 
     logging.info("ASR engine initialized.")
+
+    app.state.llm_engine = KrikriEngine(
+        host="http://localhost:11434",
+        model="ilsp/llama-krikri-8b-instruct",
+        temperature=0.2
+    )
+
+    # Initially serialize LLM inference.
+    app.state.llm_semaphore = asyncio.Semaphore(1)
+
+    logging.info("LLM engine initialized.")
 
     yield
 

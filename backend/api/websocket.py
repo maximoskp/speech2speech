@@ -12,6 +12,11 @@ from backend.core.session import AudioSession
 from backend.core.events import EventType
 from backend.modules.asr.worker import run_asr_worker
 from backend.core.config import settings
+from backend.modules.llm.conversation import Conversation
+from backend.modules.llm.worker import (
+    LLMJob,
+    run_llm_worker
+)
 
 
 logger = logging.getLogger(__name__)
@@ -61,6 +66,11 @@ async def audio_websocket(websocket: WebSocket):
 
     engine = websocket.app.state.asr_engine
     inference_semaphore = websocket.app.state.asr_semaphore
+
+    # One conversation per WebSocket connection.
+    llm_engine = websocket.app.state.llm_engine
+
+    conversation = Conversation(llm_engine)
 
     async def emit(event_type, data=None):
 
@@ -262,6 +272,21 @@ async def audio_websocket(websocket: WebSocket):
                                 inference_semaphore
                             ),
                             language=settings.asr_language
+                        )
+                    )
+
+                    llm_queue = asyncio.Queue(
+                        maxsize=settings.llm_queue_size
+                    )
+
+                    llm_worker_task = asyncio.create_task(
+                        run_llm_worker(
+                            queue=llm_queue,
+                            conversation=conversation,
+                            emit=emit,
+                            inference_semaphore=(
+                                websocket.app.state.llm_semaphore
+                            )
                         )
                     )
 
